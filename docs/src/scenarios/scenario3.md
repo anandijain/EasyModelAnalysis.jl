@@ -3,69 +3,86 @@
 Load packages:
 
 ```@example scenario3
-using EasyModelAnalysis
-using AlgebraicPetri
-using UnPack
+using EasyModelAnalysis, AlgebraicPetri, UnPack
 ```
 
 ## Generate the Model and Dataset
 
 ```@example scenario3
 function formSEIRHD()
-    SEIRHD = LabelledPetriNet([:S, :E, :I, :R, :H, :D],
-                              :expo => ((:S, :I) => (:E, :I)),
-                              :conv => (:E => :I),
-                              :rec => (:I => :R),
-                              :hosp => (:I => :H),
-                              :death => (:H => :D))
-    return SEIRHD
+    seirhd = LabelledPetriNet(
+        [:S, :E, :I, :R, :H, :D],
+        :exp => ([:S, :I] => [:E, :I]),
+        :conv => (:E => :I),
+        :rec => (:I => :R),
+        :hosp => (:I => :H),
+        :death => (:H => :D)
+    )
 end
 
 seirhd = formSEIRHD()
-sys1 = ODESystem(seirhd)
+sys_seirhd = sys1 = ODESystem(seirhd)
 ```
 
 ```@example scenario3
 function formSEIRD()
     SEIRD = LabelledPetriNet([:S, :E, :I, :R, :D],
-                             :expo => ((:S, :I) => (:E, :I)),
-                             :conv => (:E => :I),
-                             :rec => (:I => :R),
-                             :death => (:I => :D))
+	  :exp => ((:S, :I)=>(:E, :I)),
+	  :conv => (:E=>:I),
+	  :rec => (:I=>:R),
+	  :death => (:I=>:D),
+	)
     return SEIRD
 end
 
 seird = formSEIRD()
-sys2 = ODESystem(seird)
+sys_seird = sys2 = ODESystem(seird)
 ```
 
 ```@example scenario3
 function formSIRHD()
     SIRHD = LabelledPetriNet([:S, :I, :R, :H, :D],
-                             :expo => ((:S, :I) => (:I, :I)),
-                             :rec => (:I => :R),
-                             :hosp => (:I => :H),
-                             :death => (:H => :D))
+	  :exp => ((:S, :I)=>(:I, :I)),
+	  :rec => (:I=>:R),
+	  :hosp => (:I=>:H),
+      :death => (:H=>:D),
+	)
     return SIRHD
 end
 
 sirhd = formSIRHD()
-sys3 = ODESystem(sirhd)
+sys_sirhd = sys3 = ODESystem(sirhd)
 ```
 
 ```@example scenario3
 function form_seird_renew()
     seird_renew = LabelledPetriNet([:S, :E, :I, :R, :D],
-                                   :expo => ((:S, :I) => (:E, :I)),
-                                   :conv => (:E => :I),
-                                   :rec => (:I => :R),
-                                   :death => (:I => :D),
-                                   :renew => (:R => :S))
+	  :exp => ((:S, :I)=>(:E, :I)),
+	  :conv => (:E=>:I),
+	  :rec => (:I=>:R),
+	  :death => (:I=>:D),
+      :renew => (:R=>:S)
+	)
     return seird_renew
 end
 
 seird_renew = form_seird_renew()
-sys4 = ODESystem(seird_renew)
+sys_renew = sys4 = ODESystem(seird_renew)
+```
+
+```@example scenario3
+function form_seird_detect()
+    seirhd_detect = LabelledPetriNet([:S, :E, :I, :R, :H, :D],
+        :exp => ((:S, :I) => (:E, :I)),
+        :conv => (:E => :I),
+        :rec => (:I => :R),
+        :ideath => (:I => :D),
+        :hosp => (:I => :H), # this is detection rate
+        :hrec => (:H => :R), 
+        :death => (:H => :D))
+end
+seirhd_detect = form_seird_detect()
+sys_detect = sys5 = ODESystem(seirhd_detect)
 ```
 
 ```julia
@@ -87,10 +104,10 @@ AlgebraicPetri.Graph(max_seird_renew[1])
 ```@example scenario3
 t = ModelingToolkit.get_iv(sys1)
 @unpack S, E, I, R, H, D = sys1
-@unpack expo, conv, rec, hosp, death = sys1
+@unpack exp, conv, rec, hosp, death = sys_seirhd
 NN = 10.0
 @parameters u_expo=0.2 * NN u_conv=0.2 * NN u_rec=0.8 * NN u_hosp=0.2 * NN u_death=0.1 * NN N=NN
-translate_params = [expo => u_expo / N,
+translate_params = [exp => u_expo / N,
     conv => u_conv / N,
     rec => u_rec / N,
     hosp => u_hosp / N,
@@ -165,38 +182,34 @@ prob_violating_threshold(_prob, [u_conv => Uniform(0.0, 1.0)], [accumulation_I >
 
 ```@example scenario3
 # these new equations add I->D and H->R  to the model. 
-# this says now, that all I are undetected and u_hosp is the detection rate. 
-# this assumes there is always hospital capacity
-eqs2 = [Differential(t)(S) ~ -(u_expo / N) * I * S
-        Differential(t)(E) ~ (u_expo / N) * I * S - (u_conv / N) * E
-        Differential(t)(I) ~ (u_conv / N) * E - (u_hosp / N) * I - (u_rec / N) * I -
-                             (u_death / N) * I
-        Differential(t)(R) ~ (u_rec / N) * I + (u_rec / N) * H
-        Differential(t)(H) ~ (u_hosp / N) * I - (u_death / N) * H - (u_rec / N) * H
-        Differential(t)(D) ~ (u_death / N) * H + (u_death / N) * I]
-@named seirhd_detect = ODESystem(eqs2)
-sys2 = add_accumulations(seirhd_detect, [I])
-u0init2 = [
-    S => 0.9 * NN,
-    E => 0.05 * NN,
-    I => 0.01 * NN,
-    R => 0.02 * NN,
-    H => 0.01 * NN,
-    D => 0.01 * NN,
+# so :hosp is the detection rate, we assume all detected are hospitalized
+sys_detect = add_accumulations(sys_detect, [I])
+sys5 = add_accumulations(sys5, [I])
+@unpack exp, conv, rec, hrec, hosp, death, ideath = sys5
+ps = [
+    exp => 0.2,
+    conv => 0.2,
+    rec => 0.6,
+    hrec => 0.6,
+    hosp => 0.2,
+    death => 0.1,
+    ideath => 0.1,
 ]
-sys2_ = structural_simplify(sys2)
-@unpack accumulation_I = sys2_
-
-probd = ODEProblem(sys2_, u0init2, (0.0, tend))
-sold = solve(probd; saveat = ts)
+saveat = 0:tend
+prob_baseline = ODEProblem(sys1_, u0init, (0.0, tend), ps)
+probd = ODEProblem(sys5, u0init, (0.0, tend), ps)
+sol_baseline = solve(prob_baseline; saveat)
+sold = solve(probd; saveat)
+plot(sol_baseline)
 plot(sold)
 ```
 
 ```julia
+# sweep over detection rates 
 sols = []
 u_detecs = 0:0.1:1
 for x in u_detecs
-    probd = remake(probd, p = [u_hosp => x])
+    probd = remake(probd, p = [hosp => x])
     sold = solve(probd; saveat = sold.t)
     push!(sols, sold)
 end
@@ -213,16 +226,35 @@ plot(ds)
 ```
 
 ```julia
-get_uncertainty_forecast(_prob, accumulation_I, 0:100,
-                         [u_hosp => Uniform(0.0, 1.0), u_conv => Uniform(0.0, 1.0)],
-                         6 * 7)
+# now show affect on uncertainty
+get_uncertainty_forecast(probd, accumulation_I, 0:100,
+                               [hosp => Uniform(0.0, 1.0), conv => Uniform(0.0, 1.0)],
+                               6 * 7)
 
 plot_uncertainty_forecast(probd, accumulation_I, 0:100,
-                          [
-                              u_hosp => Uniform(0.0, 1.0),
-                              u_conv => Uniform(0.0, 1.0),
-                          ],
-                          6 * 7)
+                                   [
+                                       hosp => Uniform(0.0, 1.0),
+                                       conv => Uniform(0.0, 1.0),
+                                   ],
+                                   6 * 7)
+plot_uncertainty_forecast(prob_baseline, accumulation_I, 0:100,
+                                   [
+                                       conv => Uniform(0.0, 1.0),
+                                   ],
+                                   6 * 7)
+
+plot_uncertainty_forecast_quantiles(probd, D, 0:100,
+                                   [
+                                       hosp => Uniform(0.0, 1.0),
+                                       conv => Uniform(0.0, 1.0),
+                                   ],
+                                   6 * 7)
+plot_uncertainty_forecast_quantiles(prob_baseline, D, 0:100,
+                                   [
+                                       conv => Uniform(0.0, 1.0),
+                                   ],
+                                   6 * 7)
+# this indicates that taking detection rate into account increases uncertainty in forecasts
 ```
 
 > Compute the accuracy of the forecast assuming no mask mandate (ignoring Question 3) in the same way as you did in Question 1 and determine if improving the detection rate improves forecast accuracy.
@@ -232,55 +264,70 @@ plot_uncertainty_forecast(probd, accumulation_I, 0:100,
 > Convert the MechBayes SEIRHD model to an SIRHD model by removing the E compartment. Compute the same six-week forecast that you had done in Question 1a and compare the accuracy of the six-week forecasts with the forecasts done in Question 1a.
 
 ```julia
-prob2 = prob
-get_uncertainty_forecast(prob2, accumulation_I, 0:100, [u_conv => Uniform(0.0, 1.0)], 6 * 7)
+# no data to compare accuracy
+sys_sirhd = add_accumulations(sys_sirhd, [I])
+
+prob3 = ODEProblem(sys_sirhd, u0init, (0.0, 6 * 7.0), ps)
+get_uncertainty_forecast(prob3, accumulation_I, 0:100, [exp => Uniform(0.0, 1.0)], 6 * 7)
 ```
 
 ```julia
-plot_uncertainty_forecast(prob2, accumulation_I, 0:100, [u_conv => Uniform(0.0, 1.0)],
+plot_uncertainty_forecast(prob3, accumulation_I, 0:100, [exp => Uniform(0.0, 1.0)],
                           6 * 7)
 ```
 
 ```julia
-get_uncertainty_forecast_quantiles(prob2, accumulation_I, 0:100,
-                                   [u_conv => Uniform(0.0, 1.0)],
+get_uncertainty_forecast_quantiles(prob3, accumulation_I, 0:100,
+                                   [exp => Uniform(0.0, 1.0)],
                                    6 * 7)
 ```
 
 ```julia
-plot_uncertainty_forecast_quantiles(prob2, accumulation_I, 0:100,
-                                    [u_conv => Uniform(0.0, 1.0)],
+plot_uncertainty_forecast_quantiles(prob3, accumulation_I, 0:100,
+                                    [exp => Uniform(0.0, 1.0)],
                                     6 * 7)
 ```
 
 > Further modify the MechBayes SEIRHD model and do a model space exploration and model selection from the following models, based on comparing forecasts of cases and deaths to actual data: SEIRD, SEIRHD, and SIRHD models. Use data from April 1, 2020 – April 30, 2020 from the scenario location (Massachusetts) for fitting these models.  Then make out-of-sample forecasts from the same 6-week period from May 1 – June 15, 2020, and compare with actual data. Comment on the quality of the fit for each of these models.
 
 ```julia
-prob3 = prob
-get_uncertainty_forecast(prob2, accumulation_I, 0:100, [u_conv => Uniform(0.0, 1.0)], 6 * 7)
+sys_seirhd = add_accumulations(sys_seirhd, [I])
+sys_seird = add_accumulations(sys_seird, [I])
+
+prob_seirhd = ODEProblem(sys_seirhd, u0init, (0.0, 6 * 7.0), ps)
+prob_seird = ODEProblem(sys_seird, u0init, (0.0, 6 * 7.0), ps)
+prob_sirhd = ODEProblem(sys_sirhd, u0init, (0.0, 6 * 7.0), ps)
+# no data to fit to
 ```
 
 ```julia
-plot_uncertainty_forecast(prob2, accumulation_I, 0:100, [u_conv => Uniform(0.0, 1.0)],
+plot_uncertainty_forecast(prob_seirhd, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)],
                           6 * 7)
+plot_uncertainty_forecast(prob_seird, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)],
+                          6 * 7)
+plot_uncertainty_forecast(prob_sirhd, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)],
+                          6 * 7) #sus
 ```
 
 ```julia
-get_uncertainty_forecast_quantiles(prob2, accumulation_I, 0:100,
-                                   [u_conv => Uniform(0.0, 1.0)],
-                                   6 * 7)
+
+get_uncertainty_forecast_quantiles(prob_seirhd, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)],6 * 7)
+get_uncertainty_forecast_quantiles(prob_seird, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)], 6 * 7)
+get_uncertainty_forecast_quantiles(prob_sirhd, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)], 6 * 7) #sus
 ```
 
 ```julia
-plot_uncertainty_forecast_quantiles(prob2, accumulation_I, 0:100,
-                                    [u_conv => Uniform(0.0, 1.0)],
-                                    6 * 7)
+plot_uncertainty_forecast_quantiles(prob_seirhd, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)],6 * 7)
+plot_uncertainty_forecast_quantiles(prob_seird, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)], 6 * 7)
+plot_uncertainty_forecast_quantiles(prob_sirhd, accumulation_I, 0:100, [conv => Uniform(0.0, 1.0)], 6 * 7) #sus
+
 ```
 
 > Do a 3-way structural model comparison between the SEIRD, SEIRHD, and SIRHD models.
 
 ```@example scenario3
-# 
+AlgebraicPetri.ModelComparison.compare(seirhd, seirhd)
+# todo
 ```
 
 ### https://github.com/SciML/EasyModelAnalysis.jl/issues/22
