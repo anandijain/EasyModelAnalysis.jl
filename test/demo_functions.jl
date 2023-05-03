@@ -2,14 +2,23 @@ MTK = ModelingToolkit
 EMA = EasyModelAnalysis
 meqs = MTK.equations
 dd = "/Users/anand/.julia/dev/EasyModelAnalysis/data"
-function download_covidhub_data(urls, filenames)
-    for (url, filename) in zip(urls, filenames)
-        if !isfile(filename)
-            Downloads.download(url, filename)
-        end
+
+function get_covidhub_data(url; dd = "/Users/anand/.julia/dev/EasyModelAnalysis/data")
+    filename = joinpath(dd, URIs.unescapeuri(split(url, "/")[end]))
+    if !isfile(filename)
+        Downloads.download(url, filename)
     end
+    return CSV.read(filename, DataFrame)
 end
 
+select_location(df, location) = df[df.location .== location, :]
+select_location(location) = df->select_location(df, location)
+
+function date_join(colnames, dfs...)
+    d_ = innerjoin(dfs..., on = :date, makeunique = true)
+    d = d_[:, colnames]
+    return sort!(d, :date)
+end
 
 function load_ensemble(petri_fns)
     abs_fns = [joinpath(dd, fn) for fn in petri_fns]
@@ -19,26 +28,6 @@ function load_ensemble(petri_fns)
     syss = structural_simplify.(ODESystem.(petris))
     defs = map(x -> ModelingToolkit.defaults(x), syss)
     petris, syss, defs
-end
-
-function get_dataframes(; dd = "/Users/anand/.julia/dev/EasyModelAnalysis/data")
-    urls = [
-        "https://github.com/reichlab/covid19-forecast-hub/raw/master/data-truth/truth-Incident%20Cases.csv",
-        "https://github.com/reichlab/covid19-forecast-hub/raw/master/data-truth/truth-Incident%20Deaths.csv",
-        "https://github.com/reichlab/covid19-forecast-hub/raw/master/data-truth/truth-Incident%20Hospitalizations.csv",
-    ]
-    filenames = [joinpath(dd, URIs.unescapeuri(split(url, "/")[end]))
-                 for url in urls]
-    download_covidhub_data(urls, filenames)
-
-    # Read the local CSV files into DataFrames
-    dfc = CSV.read(filenames[1], DataFrame)
-    dfd = CSV.read(filenames[2], DataFrame)
-    dfh = CSV.read(filenames[3], DataFrame)
-    covidhub = calibration_data(dfc, dfh, dfd, use_hosp = true)
-    # adjust_covid_data(covidhub)
-    df = groupby_week(covidhub)
-    df, dfc, dfd, dfh, covidhub
 end
 
 "TODO validate that this is correct"
@@ -56,29 +45,6 @@ function adjust_covid_data(df::DataFrame; infection_duration = 10, hosp_duration
     end
 
     return new_df
-end
-
-function calibration_data(dfc, dfd, dfh; use_hosp = false, location = "US")
-    us_ = dfc[dfc.location .== location, :]
-    usd_ = dfd[dfd.location .== location, :]
-    ush_ = dfh[dfh.location .== location, :]
-
-    rename!(us_, :value => :cases)
-    rename!(usd_, :value => :deaths)
-    rename!(ush_, :value => :hosp)
-
-    if use_hosp
-        d_ = innerjoin(us_, usd_, ush_, on = :date, makeunique = true)
-        d = d_[:, [:date, :cases, :deaths, :hosp]]
-    else
-        d_ = innerjoin(us_, usd_, on = :date, makeunique = true)
-        d = d_[:, [:date, :cases, :deaths]]
-    end
-
-    us_ = d
-    sort!(us_, :date)
-    us = deepcopy(us_)
-    insertcols!(us, 1, :unix => datetime2unix.(DateTime.(us.date)))
 end
 
 function groupby_week(df)

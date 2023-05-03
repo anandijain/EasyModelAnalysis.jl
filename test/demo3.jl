@@ -8,7 +8,26 @@ meqs = MTK.equations
 total_pop = 30_000_000
 dd = "/Users/anand/.julia/dev/EasyModelAnalysis/data"
 include("/Users/anand/.julia/dev/EasyModelAnalysis/test/demo_functions.jl")
-df, dfc, dfd, dfh, covidhub = get_dataframes()
+
+# download data from covidhub as dataframes
+dfc = get_covidhub_data("https://github.com/reichlab/covid19-forecast-hub/raw/master/data-truth/truth-Incident%20Cases.csv")
+dfd = get_covidhub_data("https://github.com/reichlab/covid19-forecast-hub/raw/master/data-truth/truth-Incident%20Deaths.csv")
+dfh = get_covidhub_data("https://github.com/reichlab/covid19-forecast-hub/raw/master/data-truth/truth-Incident%20Hospitalizations.csv")
+
+# select location to use
+dfc, dfd, dfh = map(select_location("US"), [dfc, dfd, dfh])
+
+# rename to synchronize dataset column names with models
+rename!(dfc, :value => :cases)
+rename!(dfd, :value => :deaths)
+rename!(dfh, :value => :hosp)
+
+# create combined dataframe joined on date
+covidhub = date_join([:date, :cases, :deaths, :hosp], dfc, dfd, dfh)
+
+# aggregate to week-level data
+df = groupby_week(covidhub)
+
 plot_covidhub(df)
 N_weeks = 20;
 period_step = 10;
