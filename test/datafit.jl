@@ -1,4 +1,4 @@
-using EasyModelAnalysis, Test
+@time @time_imports using EasyModelAnalysis, Test
 
 @parameters t σ ρ β
 @variables x(t) y(t) z(t)
@@ -33,11 +33,30 @@ pvals_fit = getfield.(fit, :second)
 pvals = getfield.(p, :second)[[1, 3]]
 @test isapprox(pvals, pvals_fit, atol = 1e-4, rtol = 1e-4)
 
+losses = []
+logged_p = []
+
+callback = function (p, l)
+
+    push!(losses, deepcopy(l))
+    push!(logged_p, deepcopy(p))
+
+    return false
+end
+
+fit = datafit(prob, psub_ini, tsave, data; solve_kws = (; callback))
+@test !isempty(losses) && !isempty(logged_p)
+
 psub_ini = [σ => [27.0, 29.0], β => [2.0, 3.0]]
 fit = global_datafit(prob, psub_ini, tsave, data)
 pvals_fit = getfield.(fit, :second)
 pvals = getfield.(p, :second)[[1, 3]]
 @test isapprox(pvals, pvals_fit, atol = 1e-4, rtol = 1e-4)
+
+losses = []
+logged_p = []
+fit = global_datafit(prob, psub_ini, tsave, data;solve_kws=(;callback))
+@test !isempty(losses) && !isempty(logged_p)
 
 @variables x_2(t)
 eqs_obs = [D(D(x)) ~ σ * (y - x),
