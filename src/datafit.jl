@@ -1,6 +1,6 @@
-function l2loss(pvals, (prob, pkeys, t, data))
+function l2loss(pvals, (prob, pkeys, t, data);)
     p = Pair.(pkeys, pvals)
-    prob = remake(prob, tspan = (prob.tspan[1], t[end]), p = p)
+    prob = remake(prob; tspan = (prob.tspan[1], t[end]), p = p)
     sol = solve(prob, saveat = t)
     tot_loss = 0.0
     for pairs in data
