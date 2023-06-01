@@ -3,6 +3,7 @@ using Downloads, CSV, URIs, DataFrames, Dates
 using AlgebraicPetri
 import Catlab.ACSetInterface: has_subpart
 using MathML
+using Setfield
 using JSON3
 function download_data(url, dd)
     filename = joinpath(dd, URIs.unescapeuri(split(url, "/")[end]))
@@ -47,8 +48,25 @@ Unzip a collection of pairs
 """
 unzip(ps) = first.(ps), last.(ps)
 
+remove_t(x) = Symbol(replace(String(x), "(t)" => ""))
+
+function set_sys_defaults(sys, pn; kws...)
+    pn_defs = get_defaults(pn)
+    syms = sys_syms(sys)
+    defs = _symbolize_args(pn_defs, syms)
+    sys = ODESystem(pn; tspan = ModelingToolkit.get_tspan(sys), defaults = defs, kws...)
+end
+
 """
-Transform list of args into Symbolics variables     
+Transform list of args into Symbolics variables 
+```julia
+@parameters sig
+
+_symbolize_args([:sig => 1], [sig])
+
+Dict{Num, Int64} with 1 entry:
+  sig => 1
+```
 """
 function _symbolize_args(incoming_values, sys_vars)
     pairs = collect(incoming_values)
@@ -64,19 +82,56 @@ function get_defaults(pn)
     [snames(pn) .=> collect(pn[:concentration]); tnames(pn) .=> collect(pn[:rate])]
 end
 
+# this 
 sys_syms(sys) = [states(sys); parameters(sys)]
-remove_t(x) = Symbol(replace(String(x), "(t)" => ""))
 
-function set_sys_defaults(sys, pn; kws...)
-    pn_defs = get_defaults(pn)
-    syms = sys_syms(sys)
-    defs = _symbolize_args(pn_defs, syms)
-    sys = ODESystem(pn; tspan = ModelingToolkit.get_tspan(sys), defaults = defs, kws...)
+function get_rn_defaults(sys, rn)
+    _symbolize_args(get_defaults(rn), sys_syms(sys))
 end
 
-# function ModelingToolkit.ODESystem(pn::PropertyLabelledReactionNet)
-#     sys = ODESystem(pn)
-#     sys = set_sys_defaults(sys, pn)
+function generate_sys_args(p::AbstractPetriNet)
+    t = first(@variables t)
+    sname′(i) =
+        if has_subpart(p, :sname)
+            sname(p, i)
+        else
+            Symbol("S", i)
+        end
+    tname′(i) =
+        if has_subpart(p, :tname)
+            tname(p, i)
+        else
+            Symbol("r", i)
+        end
+
+    S = [first(@variables $Si(t)) for Si in sname′.(1:ns(p))]
+    r = [first(@parameters $ri) for ri in tname′.(1:nt(p))]
+    D = Differential(t)
+
+    tm = TransitionMatrices(p)
+
+    coefficients = tm.output - tm.input
+
+    transition_rates = [r[tr] * prod(S[s]^tm.input[tr, s] for s in 1:ns(p))
+                        for tr in 1:nt(p)]
+
+    eqs = [D(S[s]) ~ transition_rates' * coefficients[:, s] for s in 1:ns(p)]
+
+    eqs, t, S, r
+end
+
+function ModelingToolkit.ODESystem(rn::AbstractLabelledReactionNet; name = :ReactionNet,
+                                   kws...)
+    sys = ODESystem(generate_sys_args(rn)...; name = name, kws...)
+    defaults = get_rn_defaults(sys, rn)
+    @set! sys.defaults = defaults
+    sys
+end
+
+# function ModelingToolkit.ODESystem(rn::PropertyLabelledReactionNet; name = :ReactionNet, kws...)
+#     sys = ODESystem(generate_sys_args(rn)...; name = name, kws...)
+#     defaults = get_rn_defaults(sys, rn)
+#     @set! sys.defaults = defaults
 #     sys
 # end
 
@@ -108,13 +163,6 @@ function select_timeperiods(df::DataFrame, split_length::Int; step::Int = split_
             for i in 1:step:(nrow(df) - split_length + 1)]
 end
 
-# "helper to make global_datafit "
-# function make_bounds(sys; st_bound = (0.0, 1), p_bound = (0.0, 1.0))
-#     st_space = states(sys) .=> (st_bound,)
-#     p_space = parameters(sys) .=> (p_bound,)
-#     [st_space; p_space]
-# end
-
 function plot_covidhub(df; labs = ["incident deaths", "incident hosp", "incident cases"],
                        kws...)
     plt = plot(kws...)
@@ -131,43 +179,6 @@ function replace_nothings_with_defaults!(sys::ModelingToolkit.ODESystem)
     end
     sys
 end
-
-""" Convert a general PetriNet to an ODESystem
-This conversion forgets any labels or rates provided, and converts all
-parameters and variables into symbols. It does preserve the ordering of
-transitions and states though (Transition 1 has a rate of k[1], state 1 has a
-concentration of S[1])
-"""
-# function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet; name=:PropertyLabelledReactionNet, kws...)
-#   t = first(@variables t)
-
-#   sname′(i) =
-#     if has_subpart(p, :sname)
-#       sname(p, i)
-#     else
-#       Symbol("S", i)
-#     end
-#   tname′(i) =
-#     if has_subpart(p, :tname)
-#       tname(p, i)
-#     else
-#       Symbol("r", i)
-#     end
-
-#   S = [first(@variables $Si(t)) for Si in sname′.(1:ns(p))]
-#   r = [first(@parameters $ri) for ri in tname′.(1:nt(p))]
-#   D = Differential(t)
-
-#   tm = TransitionMatrices(p)
-
-#   coefficients = tm.output - tm.input
-
-#   transition_rates = [r[tr] * prod(S[s]^tm.input[tr, s] for s in 1:ns(p)) for tr in 1:nt(p)]
-
-#   eqs = [D(S[s]) ~ transition_rates' * coefficients[:, s] for s in 1:ns(p)]
-
-#   ODESystem(eqs, t, S, r; name=name, kws...)
-# end
 
 function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
                                    name = :PropMiraNet, kws...)
@@ -188,9 +199,10 @@ function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
 
     S = [first(@variables $Si(t)) for Si in sname′.(1:ns(p))]
     S_ = [first(@variables $Si) for Si in sname′.(1:ns(p))] # MathML doesn't know whether a Num should be dependent on t, so we use this to substitute 
+    st_sub_map = S_ .=> S
 
     # we have rate parameters and then the mira_parameters
-    r = [first(@parameters $ri) for ri in tname′.(1:nt(p))]
+    # r = [first(@parameters $ri) for ri in tname′.(1:nt(p))]
 
     js = [JSON3.read(tprop(p, ti)["mira_parameters"]) for ti in 1:nt(p)]
     for si in 1:ns(p)
@@ -212,7 +224,6 @@ function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
     tm = TransitionMatrices(p)
 
     coefficients = tm.output - tm.input
-    st_sub_map = S_ .=> S
     sym_rate_exprs = [substitute(MathML.parse_str(tprop(p, tr)["mira_rate_law_mathml"]),
                                  st_sub_map) for tr in 1:nt(p)]
 
@@ -222,7 +233,14 @@ function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
     # append!(mira_p, ModelingToolkit.toparam.(sts_that_should_be_ps2)) 
     # append!(ps_sub_map, sts_that_should_be_ps2 .=> ModelingToolkit.toparam.(sts_that_should_be_ps2)) # why ben, why!! XXlambdaXX
 
-    default_p = [r .=> p[:rate]; mira_p .=> last.(collect(mira_ps))]
+    # @info "this is weird, mira parameters are named differently than the tname"
+    # mp_js = map(x->JSON3.read(x["mira_parameters"]), tps)
+    # mps = merge(Dict.(mp_js)...)
+    # @assert  allequal(length.(mps)) && length(mps[1]) == 1
+    # r_ = [first(@parameters $p = def) for (p, def) in mps]
+
+    # i dont know if i need to be explicit here 
+    default_p = mira_p .=> ModelingToolkit.getdefault.(mira_ps)
     default_u0 = S .=> p[:concentration]
     defaults = [default_p; default_u0]
     # to_ps_names = Symbolics.getname.(sts_that_should_be_ps)
@@ -236,37 +254,89 @@ function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
 
     coefficients = tm.output - tm.input
 
-    transition_rates = [r[tr] * prod(S[s]^tm.input[tr, s] for s in 1:ns(p))
-                        for tr in 1:nt(p)]
+    # og 
+    # transition_rates = [r[tr] * prod(S[s]^tm.input[tr, s] for s in 1:ns(p))
+    #                     for tr in 1:nt(p)]
 
     # transition_rates= [sym_rate_exprs[tr] * prod(S[s]^tm.input[tr, s] for s in 1:ns(p))
     #                     for tr in 1:nt(p)]
 
     # disabling this for now
-    # transition_rates = [sym_rate_exprs[tr] for tr in 1:nt(p)]
-
+    transition_rates = [sym_rate_exprs[tr] for tr in 1:nt(p)]
     observable_species_idxs = filter(i -> sprop(p, i)["is_observable"], 1:ns(p))
     observable_species_names = Symbolics.getname.(S[observable_species_idxs])
 
+    r_ = [first(@variables $ri(t)) for ri in tname′.(1:nt(p))]
+
+    flux_eqs = [t_state ~ t_rate for (t_state, t_rate) in zip(r_, transition_rates)]
+
     # todo, this really needs to be validated, since idk if it's correct, update: pretty sure its busted.
-    deqs = [D(S[s]) ~ transition_rates' * coefficients[:, s]
+    deqs = [D(S[s]) ~ r_' * coefficients[:, s]
             for s in 1:ns(p) if Symbolics.getname(S[s]) ∉ observable_species_names]
 
     obs_eqs = [substitute(S[i] ~ Symbolics.parse_expr_to_symbolic(Meta.parse(sprop(p, i)["expression"]),
                                                                   @__MODULE__),
                           Dict(full_sub_map))
                for i in observable_species_idxs]
-    eqs = [deqs; obs_eqs]
-    eqs = map(identity, eqs)
-    sys = ODESystem(eqs, t, S, first.(default_p); name = name, defaults = Dict(defaults),
+
+    eqs = Equation[flux_eqs; deqs; obs_eqs]
+    # eqs = map(identity, eqs)
+    # sys = ODESystem(eqs, t; name = name)
+    sys = ODESystem(eqs, t; name = name, defaults = Dict(defaults),
                     kws...)
 end
 
-""
-function remake_for_df(prob, df; u0_fn=nothing)
-    remake_workaround!(prob, df, col_st_map)
-    remake(prob; tspan=extrema(df.t))
+function parse_tprops(p)
+    mira_ps = Set()
+    tps = tprops(p)
+    tp = first(tps)
+    flux_eqs = Equation[]
+    for i in 1:nt(p)
+        parse_tprop!(mira_ps, flux_eqs, p, i)
+    end
+    mira_ps, flux_eqs
+end
 
+# doesn't really take a tprop, but the index
+function parse_tprop!(mira_ps, flux_eqs, p, i)
+    tp = tprop(p, i)
+    tn = tname(p, i)
+    # tp = tprop(p, t)
+    mps = JSON3.read(tp["mira_parameters"])
+    dists = JSON3.read(tp["mira_parameter_distributions"])
+    for (k, v) in mps
+        d = dists[k]
+        d_ps = d["parameters"]
+        @assert d["type"] == "StandardUniform1"
+        b = (d_ps["minimum"], d_ps["maximum"])
+        pname = Symbol(k)
+
+        par = only(@parameters $pname=v [bounds = b])
+        push!(mira_ps, par)
+    end
+    
+    # @variable 
+    t = only(@parameters t) # idc 
+    tvar = only(@variables $tn(t))
+
+    rl = MathML.parse_str(tp["mira_rate_law_mathml"])
+    # mml_vars = Symbolics.get_variables(rl) all of these are !isparameter. todo check that i dont have to call toparam for it to work 
+    # rl_sub = substitute(rl, st_sub_map) ill do the substitute in ODESystem 
+    # all 
+    push!(flux_eqs, tvar ~ rl)
+    nothing
+end
+
+# filter(ModelingToolkit.isparameter, union(ModelingToolkit.get_variables.(ModelingToolkit.equations(sys))...))
+
+function mira_ps(mn)
+    mp_js = map(x -> JSON3.read(x["mira_parameters"]), tprops(mn))
+    # mps = merge(Dict.(mp_js)...)
+end
+""
+function remake_for_df(prob, df; u0_fn = nothing)
+    remake_workaround!(prob, df, col_st_map)
+    remake(prob; tspan = extrema(df.t))
 end
 
 """
@@ -308,15 +378,19 @@ function global_ensemble_fit(prob_mapping_ps, dfs, bounds; kws...)
         gress = []
         for df in dfs
             # prob = remake_for_df(prob, df)
-            @info prob.u0
+            # @info prob.u0
             r = df[1, cols]
             new_u0 = sts .=> collect(r)
-            @info new_u0
-            prob = remake(prob; u0=new_u0)
-            @info prob.u0
-            push!(gress, global_datafit(prob, bound, df.t, to_data(df, mapping); kws...))
+            # @info new_u0
+            prob = remake(prob; u0 = new_u0)
+            # @info prob.u0
+            fit = global_datafit(prob, bound, df.t, to_data(df, mapping); kws...)
+            # @info "THE FIT" fit
+            push!(gress, fit)
         end
         push!(all_gress, gress)
     end
     return all_gress
 end
+
+# function ensemble_global_datafit()

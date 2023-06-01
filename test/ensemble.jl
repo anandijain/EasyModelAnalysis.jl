@@ -3,13 +3,23 @@ using EasyModelAnalysis
 using DataFrames, AlgebraicPetri, Catlab
 using Catlab.CategoricalAlgebra: read_json_acset
 using Setfield
-
+using MathML, JSON3
 using CommonSolve
-function CommonSolve.solve(sys::ODESystem; prob_kws = (;), solve_kws = (;))
-    solve(ODEProblem(sys; prob_kws...); solve_kws...)
+
+# rescale data to be proportion of population
+function scale_df!(df)
+    for c in names(df)[2:end]
+        df[!, c] = df[!, c] ./ total_pop
+    end
 end
+function CommonSolve.solve(sys::ODESystem; prob_kws = (;), solve_kws = (;), kws...)
+    solve(ODEProblem(sys; prob_kws..., kws...); solve_kws..., kws...)
+end
+EMA.solve(pn::AbstractPetriNet; kws...) = solve(complete(structural_simplify(ODESystem(pn))); kws...)
 getsys(sol) = sol.prob.f.sys
 getsys(prob::ODEProblem) = prob.f.sys
+gi(xs, y) = map(x->x[y], xs)
+cv(x) = collect(values(x))
 read_replace_write(fn, rs) = write(fn, replace(read(fn, String), rs...))
 
 EMA = EasyModelAnalysis
@@ -21,13 +31,6 @@ total_pop = 300_000_000
 N_weeks = 20;
 period_step = 10;
 train_weeks = 10; # 10 weeks of training data, 10 weeks of testing
-
-# rescale data to be proportion of population
-function scale_df!(df)
-    for c in names(df)[2:end]
-        df[!, c] = df[!, c] ./ total_pop
-    end
-end
 
 # download data from covidhub as dataframes
 dfc = EMA.get_covidhub_data("https://github.com/reichlab/covid19-forecast-hub/raw/master/data-truth/truth-Incident%20Cases.csv",
@@ -79,10 +82,34 @@ T_PLRN = PropertyLabelledReactionNet{Union{Number, Nothing}, Union{Number, Nothi
 pns = read_json_acset.((T_PLRN,), model_fns)
 syss = ODESystem.(pns; tspan)
 
-function setup_sys(sys, pn)
-    structural_simplify(EMA.replace_nothings_with_defaults!(EMA.set_sys_defaults(sys, pn)))
+# function setup_sys(sys, pn)
+#     structural_simplify(EMA.replace_nothings_with_defaults!(EMA.set_sys_defaults(sys, pn)))
+# end
+pns
+function get_mira_bounds(p)
+    tps = tprops(p)
+    js = JSON3.read.(gi(tps, "mira_parameter_distributions"))
+    j = merge(js...)
+    dist_ts = gi(cv(j), "type")
+    @assert allequal([dist_ts; ["StandardUniform1"]]) "non StandardUniform1 distribution found"
+    bounds = []
+    for (k, v) in j
+        ps = v["parameters"]
+        # try 
+        push!(bounds, k=>(ps["minimum"], ps["maximum"]))
+        # catch e
+        #     @show v
+        # end
+    end
+    bounds
+    # great... repeats. sum(length.(js)) 
+    # @assert length(j) == length(js) "overlapping local ps names disallowed "
+
+
+
 end
 
+# for j in js
 setup_sys(syss[2], pns[2])
 syss = [setup_sys(sys, pn) for (sys, pn) in zip(syss, pns)]
 syss = complete.(syss)
@@ -91,9 +118,12 @@ probs = ODEProblem.(syss)
 og_probs = deepcopy.(probs)
 sols = solve.(probs; saveat = all_ts)
 
+sols = solve.(pns; tspan = (0, 10));
+
+
 @unpack Deaths, Hospitalizations, Cases, Extinct, Infected, Threatened = sys
 @unpack Deceased, Infectious, Hospitalized = sys2
-@unpack Infected_reported, = sys3
+@unpack Infected_reported = sys3
 
 obs_sts = Num[Deaths, Hospitalizations, Cases]
 display.(plot.(sols; idxs = obs_sts))
@@ -126,7 +156,14 @@ sol = solve(prob; saveat = dfs[1].t)
 scatter!(plt, sol; idxs = sts)
 
 fits = EMA.global_ensemble_fit(prob_mapping_ps, [df], bounds; maxiters = 100)
+fitsa = EMA.global_ensemble_fit([prob_mapping_ps[1]], train_dfs, [bounds[1]];
+                                maxiters = 1000)
+fitsb = EMA.global_ensemble_fit([prob_mapping_ps[2]], train_dfs, [bounds[2]];
+                                maxiters = 1000)
 
+for (i, fit) in enumerate(fitsb[1])
+    remake_solve(probs[2], fit, dfs[i], cs_maps[2])
+end
 # fits = EMA.global_ensemble_fit(prob_mapping_ps, dfs, bounds; maxiters=100)
 
 ps = ModelingToolkit.parameters(sys)
@@ -306,3 +343,36 @@ end
 # for 
 
 # [prob=>mapping], [df]
+
+sir_petri = LabelledReactionNet([:S, :I, :R], :inf => ((:S, :I) => (:I, :I)),
+                                :rec => (:I => :R), [0.99, 0.01, 0], [1.0, 0.5])
+sir = LabelledPetriNet([:S, :I, :R], :inf => ((:S, :I) => (:I, :I)), :rec => (:I => :R))
+LabelledReactionNet{Number, Number}(sir, [0.99, 0.01, 0], [1.0, 0.5])
+LabelledReactionNet{Any, Any}(sir;)
+sir_petri = LabelledReactionNet([:S, :I, :R], :inf => ((:S, :I) => (:I, :I)),
+                                :rec => (:I => :R); [0.99, 0.01, 0], [1.0, 0.5])
+
+pn = pns[1]
+
+ReactionNet{Float64, Float64}([:S => 10, :I => 1, :R => 0],
+                              (:inf => 0.5) => ((1, 2) => (2, 2)),
+                              (:rec => 0.1) => (2 => 3))
+
+lrn = LabelledReactionNet{Number, Number}((:S => 0.99, :I => 0.01, :R => 0),
+                                          (:inf, 0.3 / 1000) => ((:S, :I) => (:I, :I)),
+                                          (:rec, 0.2) => (:I => :R))
+lrn = LabelledReactionNet((:S => 0.99, :I => 0.01, :R => 0),
+                          (:inf, 0.3 / 1000) => ((:S, :I) => (:I, :I)),
+                          (:rec, 0.2) => (:I => :R))
+@which ODESystem(lrn)
+ODESystem(lrn)
+
+sys = eval(LORENZ_EXPR)
+@variables t x(t) y(t) z(t)
+@parameters sig rho beta
+@named sys2 = ODESystem(ModelingToolkit.equations(sys), t, [x, y, z], [sig, rho, beta];)
+
+defs = Dict(sig => 10.0, rho => 28.0, beta => 8 / 3)
+@set! sys2.defaults = defs
+
+# bounds = param
