@@ -1,10 +1,14 @@
-@time @time_imports using EasyModelAnalysis
+# @time @time_imports using EasyModelAnalysis
 using EasyModelAnalysis
 using DataFrames, AlgebraicPetri, Catlab
 using Catlab.CategoricalAlgebra: read_json_acset
 using Setfield
 using MathML, JSON3
 using CommonSolve
+
+EMA = EasyModelAnalysis
+datadir = joinpath(@__DIR__, "../data/")
+mkpath(datadir)
 
 # rescale data to be proportion of population
 function scale_df!(df)
@@ -15,16 +19,16 @@ end
 function CommonSolve.solve(sys::ODESystem; prob_kws = (;), solve_kws = (;), kws...)
     solve(ODEProblem(sys; prob_kws..., kws...); solve_kws..., kws...)
 end
-EMA.solve(pn::AbstractPetriNet; kws...) = solve(complete(structural_simplify(ODESystem(pn))); kws...)
+
+to_ssys(sys::ODESystem) = complete(structural_simplify(sys))
+to_ssys(pn) = to_ssys(ODESystem(pn))
+
+EMA.solve(pn::AbstractPetriNet; kws...) = solve(to_ssys(pn); kws...)
 getsys(sol) = sol.prob.f.sys
 getsys(prob::ODEProblem) = prob.f.sys
-gi(xs, y) = map(x->x[y], xs)
+gi(xs, y) = map(x -> x[y], xs)
 cv(x) = collect(values(x))
 read_replace_write(fn, rs) = write(fn, replace(read(fn, String), rs...))
-
-EMA = EasyModelAnalysis
-datadir = joinpath(@__DIR__, "../data/")
-mkpath(datadir)
 
 # data prep
 total_pop = 300_000_000
@@ -59,6 +63,7 @@ scale_df!(df)
 all_ts = df.t
 tspan = extrema(df.t)
 dfs = EMA.select_timeperiods(df, N_weeks; step = period_step)
+dfs_unscaled = EMA.select_timeperiods(orig_df, N_weeks; step = period_step)
 split_dfs = [EMA.train_test_split(df; train_weeks = train_weeks) for df in dfs]
 train_dfs, test_dfs = EMA.unzip(split_dfs)
 
@@ -68,7 +73,7 @@ dfts = test_dfs[1]
 
 # modeling
 # collection of models to treat as an ensemble
-# note there is a bug in these models with a faulty parameter name "XXlambdaXX", so we replace them
+# note there is a bug in these models with a faulty parameter name "XXlambdaXX", so we string replace them
 model_urls = [
     "https://github.com/indralab/mira/raw/main/notebooks/ensemble/BIOMD0000000955_miranet.json",
     "https://github.com/indralab/mira/raw/main/notebooks/ensemble/BIOMD0000000960_miranet.json",
@@ -80,46 +85,70 @@ map(x -> read_replace_write(x, ["XXlambdaXX" => "lambda"]), model_fns)
 
 T_PLRN = PropertyLabelledReactionNet{Union{Number, Nothing}, Union{Number, Nothing}, Dict}
 pns = read_json_acset.((T_PLRN,), model_fns)
-syss = ODESystem.(pns; tspan)
+syss = to_ssys.(ODESystem.(pns; tspan))
 
-# function setup_sys(sys, pn)
-#     structural_simplify(EMA.replace_nothings_with_defaults!(EMA.set_sys_defaults(sys, pn)))
-# end
-pns
-function get_mira_bounds(p)
-    tps = tprops(p)
-    js = JSON3.read.(gi(tps, "mira_parameter_distributions"))
-    j = merge(js...)
-    dist_ts = gi(cv(j), "type")
-    @assert allequal([dist_ts; ["StandardUniform1"]]) "non StandardUniform1 distribution found"
-    bounds = []
-    for (k, v) in j
-        ps = v["parameters"]
-        # try 
-        push!(bounds, k=>(ps["minimum"], ps["maximum"]))
-        # catch e
-        #     @show v
-        # end
-    end
-    bounds
-    # great... repeats. sum(length.(js)) 
-    # @assert length(j) == length(js) "overlapping local ps names disallowed "
-
-
-
-end
-
-# for j in js
-setup_sys(syss[2], pns[2])
-syss = [setup_sys(sys, pn) for (sys, pn) in zip(syss, pns)]
-syss = complete.(syss)
 sys, sys2, sys3 = syss
 probs = ODEProblem.(syss)
 og_probs = deepcopy.(probs)
 sols = solve.(probs; saveat = all_ts)
+# sols = solve.(pns; tspan = (0, 10));
+for sol in sols
+    @test sol.retcode == ReturnCode.Success
+end
 
-sols = solve.(pns; tspan = (0, 10));
+psys = to_ssys(ODESystem(LabelledPetriNet(pns[1])))
+@named psysb = ODESystem(ModelingToolkit.equations(psys)[1:(end - 3)])
 
+# pns[2] debugging... 
+# plotting the observed states for the custom rate law solution of pns[2] seems like its good 
+# but if you plot the suseptible population, it hits a steady state and doesn't change. 
+# i'm pretty sure its a model problem
+lpn2 = to_ssys(ODESystem(LabelledReactionNet{Union{Number, Nothing}, Union{Number, Nothing}
+                                             }(pns[2])))
+lprob = ODEProblem(lpn2, collect(pns[2][:concentration]), (0, 1),
+                   replace(pns[2][:rate], nothing => 0.1))
+lsol = solve(lprob)
+plot(lsol)
+
+prob = probs[1]
+bounds = ModelingToolkit.getbounds(getsys(prob))
+ps_b, bs_ = EMA._unzip(bounds)
+bounds = ps_b .=> collect.(bs_)
+# bounds = ps_b .=> ((0.0, 1.0),)
+
+# dfi = dfs[1]
+# data = EMA.to_data(dfi, mapping)
+# fit = EMA.global_datafit(prob, bounds, dfi.t, data; solve_kws=(;callback))
+# rsol = remake_solve(prob, fit, dfi, cs_maps[1])
+
+# logged_fits = [first.(bounds) .=> lp for lp in logged_p]
+
+# barely improves 
+remake_solve(prob, logged_fits[1], dfi, cs_maps[1])
+remake_solve(prob, logged_fits[end], dfi, cs_maps[1])
+
+fits = []
+all_losses = []
+all_logged = []
+for dfi in dfs
+    global losses = []
+    global logged_p = []
+    data = EMA.to_data(dfi, reverse.(col_st_map))
+    fit = EMA.global_datafit(prob, bounds, dfi.t, data; solve_kws = (; callback),
+                             loss = EMA.myl2loss)
+    rsol = remake_solve(prob, fit, dfi, cs_maps[1])
+    push!(all_losses, losses)
+    push!(all_logged, logged_p)
+    push!(fits, fit)
+end
+
+fit_df = fits_to_df(fits)
+
+# this doesn't work because when we try to use the mapping to update the u0, we end up just updating an observed expr, which is meaningless 
+rsol = remake_solve(probs[2], fit, dfi, reverse.(mapping))
+
+# this is a naive way to work around the problem 
+rsol = remake_solve(probs[2], fit, dfi, cs_maps[2])
 
 @unpack Deaths, Hospitalizations, Cases, Extinct, Infected, Threatened = sys
 @unpack Deceased, Infectious, Hospitalized = sys2
@@ -183,9 +212,15 @@ callback = function (p, l)
     return false
 end
 
+function fits_to_df(fits)
+    DataFrame(namedtuple.([Symbolics.getname.(ks) .=> vs for (ks, vs) in EMA.unzip.(fits)]))
+end
+
 function logged_p_df(pkeys, logged_p)
     DataFrame(stack(logged_p)', Symbolics.getname.(pkeys))
 end
+# function logged_p_to_fits()
+
 # there
 
 # sols = []
@@ -194,6 +229,7 @@ function fit_plot(sol, df, sts)
     plt = scatter!(plt, sol; idxs = sts)
     display(plt)
 end
+
 # for lp in logged_p[1:100:end]
 #     prob = remake(prob; p = ps .=> lp)
 #     sol = solve(prob; saveat = dfs[1].t)
@@ -201,16 +237,27 @@ end
 #     push!(sols, sol)
 # end
 
-function remake_solve(prob, fit, df, col_st_map)
+function remake_solve(prob, fit, df, col_st_map; tcol = :t, plot = true)
     cols, sts = EMA.unzip(col_st_map)
+    ts = df[:, tcol]
     r = df[1, cols]
     new_u0 = sts .=> collect(r)
     @info new_u0
-    prob = remake(prob; u0 = new_u0)
 
-    prob = remake(prob; u0 = new_u0, p = fit, tspan = extrema(df.t))
-    sol = solve(prob; saveat = df.t)
-    fit_plot(sol, df, sts)
+    prob = remake(prob; u0 = new_u0, p = fit, tspan = extrema(ts))
+    sol = solve(prob; saveat = ts)
+    plot && fit_plot(sol, df, sts)
+    sol
+end
+
+"this one doesn't update u0 but uses mapping for plot"
+function remake_solve2(prob, fit, df, mapping; tcol = :t, plot = true)
+    sts, cols = EMA.unzip(mapping)
+    ts = df[:, tcol]
+    r = df[1, cols]
+    prob = remake(prob; p = fit, tspan = extrema(ts))
+    sol = solve(prob; saveat = ts)
+    plot && fit_plot(sol, df, sts)
     sol
 end
 
@@ -344,14 +391,6 @@ end
 
 # [prob=>mapping], [df]
 
-sir_petri = LabelledReactionNet([:S, :I, :R], :inf => ((:S, :I) => (:I, :I)),
-                                :rec => (:I => :R), [0.99, 0.01, 0], [1.0, 0.5])
-sir = LabelledPetriNet([:S, :I, :R], :inf => ((:S, :I) => (:I, :I)), :rec => (:I => :R))
-LabelledReactionNet{Number, Number}(sir, [0.99, 0.01, 0], [1.0, 0.5])
-LabelledReactionNet{Any, Any}(sir;)
-sir_petri = LabelledReactionNet([:S, :I, :R], :inf => ((:S, :I) => (:I, :I)),
-                                :rec => (:I => :R); [0.99, 0.01, 0], [1.0, 0.5])
-
 pn = pns[1]
 
 ReactionNet{Float64, Float64}([:S => 10, :I => 1, :R => 0],
@@ -359,11 +398,28 @@ ReactionNet{Float64, Float64}([:S => 10, :I => 1, :R => 0],
                               (:rec => 0.1) => (2 => 3))
 
 lrn = LabelledReactionNet{Number, Number}((:S => 0.99, :I => 0.01, :R => 0),
-                                          (:inf, 0.3 / 1000) => ((:S, :I) => (:I, :I)),
+                                          (:inf, 0.9) => ((:S, :I) => (:I, :I)),
                                           (:rec, 0.2) => (:I => :R))
+
+sir_sys = ODESystem(lrn)
+sir_sol = solve(sir_sys; tspan = (0, 100), saveat = 1)
+sir_df = DataFrame(sir_sol)
+rename!(sir_df, "timestamp" => "t")
+sir_bs = parameters(sir_sys) .=> ((0.0, 1.0),)
+_sir_data = Symbol.(names(sir_df)[2:end]) .=> collect.(eachcol(sir_df)[2:end])
+# sir_data = EMA._symbolize_args(_sir_data, EMA.sys_syms(sir_sys))
+
+sir_prob = ODEProblem(sir_sys, [], (0, 100))
+
+sir_data = states(sir_sys) .=> collect.(eachcol(sir_df)[2:end])
+sir_fit = EMA.global_datafit(sir_prob, sir_bs, 0:100, sir_data)
+sir_col_st = names(sir_df)[2:end] .=> states(sir_sys)
+sir_fit_sol = remake_solve(sir_prob, sir_fit, sir_df, sir_col_st; plot = false)
+
 lrn = LabelledReactionNet((:S => 0.99, :I => 0.01, :R => 0),
                           (:inf, 0.3 / 1000) => ((:S, :I) => (:I, :I)),
                           (:rec, 0.2) => (:I => :R))
+
 @which ODESystem(lrn)
 ODESystem(lrn)
 
@@ -376,3 +432,100 @@ defs = Dict(sig => 10.0, rho => 28.0, beta => 8 / 3)
 @set! sys2.defaults = defs
 
 # bounds = param
+
+p = pns[1]
+sys = ODESystem(p)
+ssys = to_ssys(sys)
+prob = ODEProblem(ssys, [], (0, 100))
+sol = solve(prob)
+_obs_sts = last.(cs_maps[1])
+
+# this is weird, eh not really. 
+plt = plot(sol; idxs = _obs_sts)
+plt = plot(sol; idxs = obs_sts)
+
+dfi = dfs[1]
+data = EMA.to_data(dfi, reverse.(col_st_map))
+fit = EMA.global_datafit(prob, bounds, dfi.t, data; solve_kws = (; callback),
+                         loss = EMA.myl2loss)
+fit = EMA.global_datafit(prob, bounds, dfi.t, data)
+rsol = remake_solve(prob, fit, dfi, cs_maps[1])
+rsol = remake_solve(prob, fit, dfi, reverse.(mapping))
+
+lpn = LabelledReactionNet{Number, Number}(p)
+lsys = to_ssys(ODESystem(lpn))
+lprob = ODEProblem(lsys, [], (0, 100))
+lsol = solve(lprob)
+plot(lsol)
+lbounds = parameters(lsys) .=> ((0.0, 1.0),)
+
+# this gives broken since we dont have observed on that sys dispatch
+lfit = EMA.global_datafit(lprob, lbounds, dfi.t, EMA.to_data(dfi, mapping))
+rsol = remake_solve(lprob, fit, dfi, cs_maps[1])
+
+to_fit(prob) = parameters(getsys(prob)) .=> prob.p
+
+rsol = remake_solve(lprob, to_fit(lprob), dfi, cs_maps[1])
+lfit = EMA.global_datafit(lprob, lbounds, dfi.t, EMA.to_data(dfi, reverse.(cs_maps[1])))
+rsol = remake_solve(lprob, fit, dfi, cs_maps[1])
+
+lbounds = [states(lsys); parameters(lsys)] .=> ((0.0, 1.0),)
+
+# rsol = remake_solve(lprob, to_fit(lprob), dfi, cs_maps[1])
+lfit = EMA.global_datafit(lprob, lbounds, dfi.t, EMA.to_data(dfi, reverse.(cs_maps[1])))
+rsol = remake_solve(lprob, lfit, dfi, cs_maps[1])
+@which ODESystem(lpn)
+# okay i think i've decided to throw out the covidhub fitting entirely
+# i think the best mve now is to take a model, make its parameters forced states
+# then perform the iterative fitting on a collection of similar models 
+# this mimics the structure of the covidhub setup, without the torture of dealing with other people's models and real world data
+# we probably still want to demo custom rate laws, so maybe we have the model that produces the data we fit against has custom nonlinearities 
+# the other thing is resolving the inconsistent u0 updates 
+Cases = Diagnosed + Recognized + Threatened
+Hospitalizations = Recognized + Threatened
+Deaths = Extinct
+lmapping = [Cases => :cases, Deaths => :deaths, Hospitalizations => :hosp]
+lmapping = [Deaths => :deaths]
+# lmapping = [D(Deaths)=>:deaths] would be cool if it worked
+lfit = EMA.global_datafit(lprob, lbounds, dfi.t, EMA.to_data(dfi, lmapping))
+
+rsol = remake_solve(lprob, lfit, dfi, reverse.(lmapping))
+
+rsol = remake_solve2(lprob, lfit, dfi, lmapping)
+rlprob = remake(lprob;
+                u0 = [lsys.Extinct => dfi.deaths[1], lsys.Recognized => dfi.cases[1]])
+lfit = EMA.global_datafit(rlprob, lbounds, dfi.t, EMA.to_data(dfi, lmapping))
+rsol = remake_solve2(rlprob, lfit, dfi, lmapping)
+
+ldata = [Deaths => cumsum(dfi.deaths)]
+lfit = EMA.global_datafit(lprob, lbounds, dfi.t, ldata)
+# this one is good! 
+rsol = remake_solve(lprob, lfit, dfi, reverse.(lmapping))
+
+lbounds = parameters(lsys) .=> ((0.0, 1.0),)
+lbounds = [states(lsys); parameters(lsys)] .=> ((0.0, 1.0),)
+
+lfits = []
+for dfi in dfs
+    # ldata = [Deaths => cumsum(dfi.deaths)]
+    ldata = [Deaths => dfi.deaths]
+    # lprob = remake(lprob;
+    #                 u0 = [lsys.Extinct => dfi.deaths[1], lsys.Recognized => dfi.cases[1]])
+    lfit = EMA.global_datafit(lprob, lbounds, dfi.t, ldata)
+    rsol = remake_solve(lprob, lfit, dfi, reverse.(lmapping);plot=false)
+    plt = plot(dfi.t, dfi.deaths)
+    plot!(plt, rsol; idxs=Deaths)
+    display(plt)
+    push!(lfits, lfit)
+end
+
+# la = Modeling
+
+sirhd_fn = "/Users/anand/code/julia/EasyModelAnalysis.jl/data/sirhd.json"
+sirhd_pn = read_json_acset(LabelledPetriNet, sirhd_fn)
+sirhd = ODESystem(sirhd_pn)
+defaults =EMA.sys_syms(sirhd) .=> 0.5
+sirhd = ODESystem(sirhd_pn;defaults)
+plot(solve(sirhd;tspan=(0,100)))
+lbounds = [states(lsys); parameters(lsys)] .=> ((0.0, 1.0),)
+lfit = EMA.global_datafit(lprob, lbounds, dfi.t, ldata)

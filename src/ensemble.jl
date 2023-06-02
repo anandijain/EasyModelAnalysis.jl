@@ -202,7 +202,7 @@ function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
     st_sub_map = S_ .=> S
 
     # we have rate parameters and then the mira_parameters
-    # r = [first(@parameters $ri) for ri in tname′.(1:nt(p))]
+    r = [first(@parameters $ri) for ri in tname′.(1:nt(p))]
 
     js = [JSON3.read(tprop(p, ti)["mira_parameters"]) for ti in 1:nt(p)]
     for si in 1:ns(p)
@@ -239,8 +239,10 @@ function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
     # @assert  allequal(length.(mps)) && length(mps[1]) == 1
     # r_ = [first(@parameters $p = def) for (p, def) in mps]
 
+    
     # i dont know if i need to be explicit here 
-    default_p = mira_p .=> ModelingToolkit.getdefault.(mira_ps)
+    @show mira_p  mira_ps
+    default_p = mira_p .=> ModelingToolkit.getdefault.(mira_p)
     default_u0 = S .=> p[:concentration]
     defaults = [default_p; default_u0]
     # to_ps_names = Symbolics.getname.(sts_that_should_be_ps)
@@ -262,16 +264,16 @@ function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
     #                     for tr in 1:nt(p)]
 
     # disabling this for now
-    transition_rates = [sym_rate_exprs[tr] for tr in 1:nt(p)]
+    transition_rates = [r[tr]* sym_rate_exprs[tr] for tr in 1:nt(p)]
     observable_species_idxs = filter(i -> sprop(p, i)["is_observable"], 1:ns(p))
     observable_species_names = Symbolics.getname.(S[observable_species_idxs])
 
-    r_ = [first(@variables $ri(t)) for ri in tname′.(1:nt(p))]
+    # r_ = [first(@variables $ri(t)) for ri in tname′.(1:nt(p))]
 
-    flux_eqs = [t_state ~ t_rate for (t_state, t_rate) in zip(r_, transition_rates)]
+    # flux_eqs = [t_state ~ t_rate for (t_state, t_rate) in zip(r_, transition_rates)]
 
     # todo, this really needs to be validated, since idk if it's correct, update: pretty sure its busted.
-    deqs = [D(S[s]) ~ r_' * coefficients[:, s]
+    deqs = [D(S[s]) ~ transition_rates' * coefficients[:, s]
             for s in 1:ns(p) if Symbolics.getname(S[s]) ∉ observable_species_names]
 
     obs_eqs = [substitute(S[i] ~ Symbolics.parse_expr_to_symbolic(Meta.parse(sprop(p, i)["expression"]),
@@ -279,11 +281,92 @@ function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet;
                           Dict(full_sub_map))
                for i in observable_species_idxs]
 
-    eqs = Equation[flux_eqs; deqs; obs_eqs]
+    # eqs = Equation[flux_eqs; deqs; obs_eqs]
+    eqs = Equation[deqs; obs_eqs]
     # eqs = map(identity, eqs)
     # sys = ODESystem(eqs, t; name = name)
     sys = ODESystem(eqs, t; name = name, defaults = Dict(defaults),
                     kws...)
+end
+
+function ModelingToolkit.ODESystem(p::PropertyLabelledReactionNet; name = :MiraNet, kws...)
+    t = first(@variables t)
+    D = Differential(t)
+    tm = TransitionMatrices(p)
+    coefficients = tm.output - tm.input
+
+    sname′(i) =
+        if has_subpart(p, :sname)
+            sname(p, i)
+        else
+            Symbol("S", i)
+        end
+    tname′(i) =
+        if has_subpart(p, :tname)
+            tname(p, i)
+        else
+            Symbol("r", i)
+        end
+
+    S = [first(@variables $Si(t)) for Si in sname′.(1:ns(p))]
+    S_ = [first(@variables $Si) for Si in sname′.(1:ns(p))] # MathML doesn't know whether a Num should be dependent on t, so we use this to substitute 
+    st_sub_map = S_ .=> S
+
+    t_ps, flux_eqs = parse_tprops(p)
+    s_ps = union(parse_prop_parameters.(sprops(p))...)
+    ps = union(t_ps, s_ps)
+    ps_sub_vars = [only(@variables $x) for x in Symbolics.getname.(ps)]
+    ps_sub_map = ps_sub_vars .=> ps
+
+    subs = [ps_sub_map; st_sub_map]
+    subd = Dict(subs)
+
+    flux_eqs = map(x -> substitute(x, subd), flux_eqs)
+    tvars = ModelingToolkit.lhss(flux_eqs)
+
+    default_p = ps .=> ModelingToolkit.getdefault.(ps)
+    default_u0 = S .=> p[:concentration]
+    defaults = Dict([default_p; default_u0])
+
+    observable_species_idxs = filter(i -> sprop(p, i)["is_observable"], 1:ns(p))
+    observable_species_names = Symbolics.getname.(S[observable_species_idxs])
+
+    # i don't understand where p[:rate] comes into play. it seems like rate is only needed if there aren't custom rate laws
+    deqs = [D(S[s]) ~ tvars' * coefficients[:, s]
+            for s in 1:ns(p) if Symbolics.getname(S[s]) ∉ observable_species_names]
+
+    # there should be a mathml but there isnt
+    obs_eqs = [substitute(S[i] ~ Symbolics.parse_expr_to_symbolic(Meta.parse(sprop(p, i)["expression"]),
+                                                                  @__MODULE__),
+                          Dict(subs))
+               for i in observable_species_idxs]
+
+    eqs = Equation[flux_eqs; deqs; obs_eqs]
+    ODESystem(eqs, t; name, defaults, kws...)
+end
+
+"can give it a S or T and itll make the pars from the prop dict"
+function parse_prop_parameters(prop)
+    pars = []
+    !haskey(prop, "mira_parameters") && (return pars)
+
+    mps = JSON3.read(prop["mira_parameters"])
+    dists = JSON3.read(prop["mira_parameter_distributions"])
+    for (k, v) in mps
+        d = dists[k]
+        pname = Symbol(k)
+        if !isnothing(d) && haskey(d, "parameters")
+            d_ps = d["parameters"]
+            @assert d["type"] == "StandardUniform1"
+            b = (d_ps["minimum"], d_ps["maximum"])
+
+            par = only(@parameters $pname=v [bounds = b])
+        else
+            par = only(@parameters $pname = v)
+        end
+        push!(pars, par)
+    end
+    pars
 end
 
 function parse_tprops(p)
@@ -292,39 +375,28 @@ function parse_tprops(p)
     tp = first(tps)
     flux_eqs = Equation[]
     for i in 1:nt(p)
-        parse_tprop!(mira_ps, flux_eqs, p, i)
+        eq, pars = parse_tprop(p, i)
+        push!(flux_eqs, eq)
+
+        [push!(mira_ps, x) for x in pars] # no append!(set, xs)??
     end
-    mira_ps, flux_eqs
+    collect(mira_ps), flux_eqs
 end
 
 # doesn't really take a tprop, but the index
-function parse_tprop!(mira_ps, flux_eqs, p, i)
+function parse_tprop(p, i)
     tp = tprop(p, i)
     tn = tname(p, i)
-    # tp = tprop(p, t)
-    mps = JSON3.read(tp["mira_parameters"])
-    dists = JSON3.read(tp["mira_parameter_distributions"])
-    for (k, v) in mps
-        d = dists[k]
-        d_ps = d["parameters"]
-        @assert d["type"] == "StandardUniform1"
-        b = (d_ps["minimum"], d_ps["maximum"])
-        pname = Symbol(k)
 
-        par = only(@parameters $pname=v [bounds = b])
-        push!(mira_ps, par)
-    end
-    
-    # @variable 
+    pars = parse_prop_parameters(tp)
+
     t = only(@parameters t) # idc 
     tvar = only(@variables $tn(t))
 
     rl = MathML.parse_str(tp["mira_rate_law_mathml"])
-    # mml_vars = Symbolics.get_variables(rl) all of these are !isparameter. todo check that i dont have to call toparam for it to work 
-    # rl_sub = substitute(rl, st_sub_map) ill do the substitute in ODESystem 
-    # all 
-    push!(flux_eqs, tvar ~ rl)
-    nothing
+    # push!(flux_eqs, )
+    eq = tvar ~ rl
+    eq, pars
 end
 
 # filter(ModelingToolkit.isparameter, union(ModelingToolkit.get_variables.(ModelingToolkit.equations(sys))...))
